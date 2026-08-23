@@ -1,0 +1,20 @@
+# ═══════════════════════════════════════════════════════════════
+# Nacos 共享配置 — Redis 哨兵模式
+# ═══════════════════════════════════════════════════════════════
+# Data ID: shared-redis.yaml
+# Group: DEFAULT_GROUP
+#
+# 说明：
+#   - 哨兵模式：客户端先连 Sentinel → Sentinel 返回当前主节点 → 连 Redis
+#   - 主节点自动故障转移，客户端无需修改连接信息
+#   - redis-sentinel 是 K8s Service 名，指向 Sentinel Deployment
+# ═══════════════════════════════════════════════════════════════
+
+spring:
+  redis:
+    sentinel:
+      # 哨兵节点地址（多个逗号分隔，K8s Service 自动负载均衡）
+      # 占位符引用 Helm 注入的环境变量（见 templates/_helpers.tpl doj.middleware-env 宏）
+      nodes: ${DOJ_REDIS_SENTINEL_NODES:redis-sentinel:26379}
+      # Sentinel 中注册的主节点名称（与 redis-config ConfigMap 一致）
+      master: ${DOJ_REDIS_MASTER_NAME:mymaster}

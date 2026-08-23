@@ -1,0 +1,38 @@
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled }}
+{{/*
+  ═══════════════════════════════════════════════════════════════
+  ClusterIssuer — Let's Encrypt 证书签发器（集群级资源）
+  ═══════════════════════════════════════════════════════════════
+  作用：告诉 cert-manager "用这个 ACME 账号向 Let's Encrypt 申请证书"
+  由本 chart 自动创建，不需要手动 kubectl apply。
+
+  http01 验证原理：
+    1. Let's Encrypt 要求证明你拥有 ohjudge.asia
+    2. cert-manager 通过 Ingress 在域名下暴露一个临时 HTTP 路径
+    3. Let's Encrypt 访问 http://ohjudge.asia/.well-known/acme-challenge/xxx
+    4. 访问成功 → 签发证书 → 存入 secretName 指定的 Secret
+    5. ingress.yaml 里的 tls.secretName 引用同一个 Secret
+
+  注意：ClusterIssuer 是集群级资源，只有一个（不随 namespace 重复）
+  ═══════════════════════════════════════════════════════════════
+*/}}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.ingress.tls.clusterIssuer | quote }}
+spec:
+  acme:
+    # 生产环境 Let's Encrypt 服务器（正式签发，有速率限制）
+    # 测试环境可换成 https://acme-staging-v02.api.letsencrypt.org/directory
+    server: https://acme-v02.api.letsencrypt.org/directory
+    # 证书到期提醒邮箱，由 values.yaml 配置
+    email: {{ .Values.ingress.tls.issuerEmail | quote }}
+    # Let's Encrypt 账户私钥存放位置（自动生成）
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            # 使用 ingress-nginx controller 完成 HTTP-01 挑战
+            class: {{ .Values.ingress.className | quote }}
+{{- end }}

@@ -1,0 +1,21 @@
+# ============================================================
+# Redis 哨兵模式
+# 原理：客户端连接哨兵节点 → 哨兵返回当前 master 地址
+#       → 客户端直连 master 读写。master 挂了哨兵自动选新主
+#       → 客户端收到 +switch-master → 自动切到新 master
+# 注意：哨兵模式不能配 spring.redis.host，配了就失效
+# ============================================================
+spring:
+  redis:
+    sentinel:
+      master: ${DOJ_REDIS_MASTER_NAME:mymaster}
+      nodes: ${DOJ_REDIS_SENTINEL_NODES:127.0.0.1:26379}
+    password: ${DOJ_REDIS_PWD:}
+    lettuce:
+      pool:
+        max-active: 10
+        max-idle: 5
+        min-idle: 2
+        max-wait: 3000ms
+    timeout: 3000ms
+    connect-timeout: 3000ms

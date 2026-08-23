@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: user-service
+  profiles:
+    active: common
+  config:
+    import:
+      - optional:nacos:shared-jdbc.yaml
+      - optional:nacos:shared-jwt.yaml
+      - optional:nacos:shared-rabbitmq.yaml
+      - optional:nacos:shared-redis.yaml
+  cloud:
+    nacos:
+      server-addr: ${DOJ_NACOS_SERVER_ADDR:nacos:8848}
+
+# shared-jdbc.yaml
+#s
+
+# shared-swagger.yaml
+#logging:
+#    level:
+#        com.decade: debug
+#    pattern:
+#        dateformat: HH:mm:ss:SSS
+#knife4j:
+#    enable: true
+#    openapi:
+#        title: ${doj.swagger.title}
+#        description: "Duck Online Judge API"
+#        email: "decade-qzj@foxmail.com"
+#        version: v1.0.0
+#        group:
+#            default:
+#                group-name: default
+#                api-rule: package
+#                api-rule-resources:
+#                    - ${doj.swagger.scan}
+
+# shared-jwt.yaml
+#doj:
+#    jwt:
+#        location: classpath:doj.jks
+#        alias: decade
+#        password: doj123
+#        tokenTTL: 30m
+#        authorization: "authorization"
+#        secret-key: "uid"

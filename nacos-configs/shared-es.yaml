@@ -1,0 +1,10 @@
+# ============================================================
+# Elasticsearch 单机模式
+# 原理：OJ 场景 ES 存题目索引，不是第一手数据（第一手在 MySQL）
+#       挂了从 MySQL 全量重建索引即可，不需要集群的高可用成本
+# ============================================================
+spring:
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://127.0.0.1:9200}
+    connection-timeout: 5s
+    socket-timeout: 30s

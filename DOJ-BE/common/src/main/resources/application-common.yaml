@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════════
+# D-OnlineJudge — 公共配置 (application-common.yaml)
+# ═══════════════════════════════════════════════════════════════
+# 说明：
+#   此配置由 Spring 加载作为默认值。
+#   K8s 部署时通过环境变量（DOJ_PORT_GATEWAY 等）覆盖。
+#   本地开发时使用下面的默认值（修改为适合本地环境的地址）。
+# ═══════════════════════════════════════════════════════════════
+
+doj:
+    port:
+        # ─── 各微服务端口 ──────────────────────────────────────
+        # K8s 环境通过 env 覆盖，本地开发可用默认值
+        gateway-service: ${DOJ_PORT_GATEWAY:8080}
+        user-service: ${DOJ_PORT_USER:8081}
+        sandbox-service: ${DOJ_PORT_SANDBOX:8082}
+        problem-service: ${DOJ_PORT_PROBLEM:8083}
+        submission-service: ${DOJ_PORT_SUBMISSION:8084}
+
+    resource:
+        # ─── 代码临时存储路径 ──────────────────────────────────
+        # K8s 环境：应挂载到容器内路径如 /app/data/codes/
+        # 本地开发：Windows 路径如 D:/DOJ-Data/codes/
+        # 通过环境变量 DOJ_CODE_PATH 在部署时覆盖
+        code-path: ${DOJ_CODE_PATH:/app/data/codes/}
+
+        # ─── 文件/头像上传路径 ──────────────────────────────────
+        # K8s 环境：应挂载 PersistentVolume 到容器内路径
+        # 通过环境变量 DOJ_RESOURCE_LOCATION / DOJ_RESOURCE_REQUEST 覆盖
+        location: ${DOJ_RESOURCE_LOCATION:/app/data/files/}
+        request: ${DOJ_RESOURCE_REQUEST:/static/}

@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: sandbox-service
+  profiles:
+    active: common
+  config:
+    import:
+      - optional:nacos:shared-jwt.yaml
+      - optional:nacos:shared-jdbc.yaml
+      - optional:nacos:shared-rabbitmq.yaml
+      - optional:nacos:shared-redis.yaml
+  cloud:
+    nacos:
+      server-addr: ${DOJ_NACOS_SERVER_ADDR:nacos:8848}

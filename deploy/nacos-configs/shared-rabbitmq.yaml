@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════════
+# Nacos 共享配置 — RabbitMQ 消息队列 客户端连接
+# ═══════════════════════════════════════════════════════════════
+# Data ID: shared-rabbitmq.yaml
+# Group: DEFAULT_GROUP
+#
+# 说明：
+#   - 用于判题/评测等异步任务的提交和结果回调
+#   - rabbitmq 是 K8s Service 名，指向 rabbitmq Headless Service
+# ═══════════════════════════════════════════════════════════════
+
+spring:
+  rabbitmq:
+    # ─── 连接地址（支持多节点，逗号分隔）─────────────────────
+    addresses: ${doj.rabbitmq.host:rabbitmq}:${doj.rabbitmq.port:5672}
+    username: ${doj.rabbitmq.user:guest}
+    password: ${doj.rabbitmq.pwd:guest}
+
+    # ─── 队列声明（自动创建）─────────────────────────────────
+    listener:
+      simple:
+        acknowledge-mode: auto
+        prefetch: 1
+        concurrency: 2
+        max-concurrency: 8
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 2000
+          multiplier: 2.0

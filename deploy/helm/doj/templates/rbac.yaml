@@ -1,0 +1,71 @@
+{{/*
+  ═══════════════════════════════════════════════════════════════
+  D-OnlineJudge — RBAC 权限配置
+  ═══════════════════════════════════════════════════════════════
+  创建 ServiceAccount 并授予 Pod 查看同类资源的权限。
+  主要用于服务发现：Pod 通过 K8s API 查询同 namespace 下的
+  其他 Service / Endpoints，但也可以完全依赖 Nacos 做服务发现，
+  RBAC 在这里是可选的安全增强。
+  ═══════════════════════════════════════════════════════════════
+*/}}
+
+# ─── ServiceAccount：DOJ 微服务共用身份 ──────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: doj-sa
+  namespace: {{ .Release.Namespace }}
+
+---
+# ─── Role：允许读取 Pod / Service / Endpoints ──────────────
+# 原理：Spring Cloud Kubernetes 需要读取 Endpoints 来做
+#       K8s-native 服务发现
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: doj-role
+  namespace: {{ .Release.Namespace }}
+rules:
+  # 读取 Pod（获取 IP、状态）
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # 读取 Service（获取 ClusterIP、端口）
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  # 读取 Endpoints（Service 对应的 Pod IP 列表）
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+  # ─── 判题 Job 管理（K8sSandboxRunner 动态创建/删除判题 Job）───
+  # K8sSandboxRunner 需要：
+  #   create/delete jobs  → 创建/清理判题 Job
+  #   get/list jobs       → 幂等检查 / 查询状态
+  #   pods/log            → 读取判题输出（/usr/bin/time -v）
+  # ⚠️ 注意：没有 jobs 的 create/delete 权限，判题会报
+  #    ApiException(403)，且 ApiException.getMessage() 为空，
+  #    日志只显示"判题容器创建失败"而看不到原因。
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # 读取 Pod 日志（readNamespacedPodLog 需要 pods/log 子资源权限）
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+
+---
+# ─── RoleBinding：绑定 doj-sa + doj-role ────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: doj-rb
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: doj-role
+subjects:
+  - kind: ServiceAccount
+    name: doj-sa
+    namespace: {{ .Release.Namespace }}

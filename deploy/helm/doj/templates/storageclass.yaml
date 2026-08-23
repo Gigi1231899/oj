@@ -1,0 +1,21 @@
+{{- if .Values.storageClass.create }}
+# ═══════════════════════════════════════════════════════════════
+# 自定义 StorageClass — 标准盘（省钱）
+# ═══════════════════════════════════════════════════════════════
+# 原因：AKS 默认 StorageClass managed-csi 的 SKU 是 PremiumSSD_LRS
+#       （高级 SSD，贵）。测试/跑通阶段用标准 SSD 足够，省约 60%。
+# 若已有同名 SC，Helm 幂等更新，不会重复创建。
+# 想切回默认高级盘：把 values.yaml 的 global.storageClass 改成 managed-csi
+# ═══════════════════════════════════════════════════════════════
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.global.storageClass }}
+provisioner: disk.csi.azure.com
+parameters:
+  skuname: {{ .Values.storageClass.skuName | default "StandardSSD_LRS" }}
+  fsType: ext4
+reclaimPolicy: Delete   # 删除 PVC 即删除磁盘，避免残留计费
+volumeBindingMode: WaitForFirstConsumer # 等 Pod 调度后再建盘，避免多可用区错配
+allowVolumeExpansion: true               # 后续可扩容（不可缩容）
+{{- end }}

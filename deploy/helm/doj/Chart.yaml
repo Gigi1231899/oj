@@ -1,0 +1,6 @@
+apiVersion: v2
+name: doj
+description: OnlineJudge — Spring Cloud 微服务 + Python Agent 完整部署
+type: application
+version: 0.1.0
+appVersion: "1.0"

@@ -1,0 +1,536 @@
+{{/*
+  ═══════════════════════════════════════════════════════════════
+  D-OnlineJudge — 微服务模板
+  ═══════════════════════════════════════════════════════════════
+  包含：
+    - 5 个 Java 微服务（gateway / user / problem / sandbox / submission）
+    - 1 个 Python Agent（AI 评测）
+    - 1 个 Vue 前端（Nginx）
+    - Nacos（注册/配置中心）
+  ═══════════════════════════════════════════════════════════════
+*/}}
+
+# ═══════════════════════════════════════════════════════════════
+# 全局密文 — 从 Secret 注入所有服务的公共环境变量
+# ═══════════════════════════════════════════════════════════════
+# 通过 _helpers.tpl 中的 doj.middleware-env 宏，每个服务容器自动获得：
+#   DOJ_DB_HOST     → 主库写地址
+#   DOJ_DB_READ_HOST → 从库读地址（可选）
+#   DOJ_REDIS_NODES → Redis Sentinel 地址
+#   DOJ_RABBITMQ    → RabbitMQ 地址
+#   DOJ_ES_URIS     → Elasticsearch 地址
+#   DOJ_NACOS       → Nacos 注册中心地址
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# 部署顺序说明：
+#   1. 先部署中间件（middleware.yaml）
+#   2. 等待 MySQL、Nacos 就绪
+#   3. 部署微服务（services.yaml）
+#   4. 服务启动后注册到 Nacos，通过 Service 名互相发现
+# ═══════════════════════════════════════════════════════════════
+
+{{- if .Values.sandbox.enabled }}
+# ═══════════════════════════════════════════════════════════════
+# 判题代码共享卷（Azure Files，RWX）
+# sandbox-service 与 K8sSandboxRunner 动态创建的判题 Job 共享此 PVC：
+#   - sandbox 副本把代码写到 /app/data/codes/<uuid>/（= PVC 根的 <uuid> 子目录）
+#   - 判题 Job 用 volumeMounts.subPath=<uuid> 只挂载自己那一个子目录到 /app
+# 必须 ReadWriteMany（多 Pod 同时挂），所以 storageClass 用 azurefile-csi
+# ═══════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.sandbox.codeStorage.pvcName | default "doj-code-pvc" }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: {{ .Values.sandbox.codeStorage.storageClass | default "azurefile-csi" }}
+  resources:
+    requests:
+      storage: {{ .Values.sandbox.codeStorage.size | default "10Gi" }}
+---
+{{- end }}
+
+{{- range $name, $svc := dict
+  "gateway"    .Values.gateway
+  "user"       .Values.user
+  "problem"    .Values.problem
+  "sandbox"    .Values.sandbox
+  "submission" .Values.submission
+}}
+{{- if $svc.enabled }}
+
+# ═══════════════════════════════════════════════════════════════
+# {{ $name | title }} Service Deployment
+# ═══════════════════════════════════════════════════════════════
+# 镜像路径: <imageRegistry>/<服务名>:<imageTag>
+# 从 ACR 拉取，使用 acr-secret 认证
+# ═══════════════════════════════════════════════════════════════
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: {{ $name }}
+spec:
+  replicas: {{ $svc.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+    spec:
+      {{- if eq $name "sandbox" }}
+      # 【RBAC】sandbox 以 doj-sa 身份调用 K8s API 创建/删除判题 Job。
+      # 不指定 serviceAccountName 则用 default SA（无 batch/jobs 权限），
+      # K8sSandboxRunner 创建 Job 会 403 → ApiException → 判题全部失败。
+      serviceAccountName: doj-sa
+      {{- end }}
+      {{- if $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml $.Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+
+      # ─── 新增：等待 Nacos 就绪后再启动主容器 ──────────────
+      initContainers:
+        - name: wait-for-nacos
+          image: dojacr.azurecr.io/doj/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -zv nacos 9848 2>/dev/null && [ "$(wget -q -O- http://nacos:8848/nacos/v1/console/health/readiness 2>/dev/null)" = "OK" ]; do
+              echo ">>> Nacos 未完全就绪，5秒后重试..."
+              sleep 5
+              done
+
+      containers:
+        - name: {{ $name }}
+          image: {{ $.Values.global.imageRegistry }}/{{ $svc.image }}:{{ $.Values.global.imageTag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ $svc.port }}
+              name: http
+          env:
+            # JVM 启动参数（堆内存等）
+            - name: JAVA_OPTS
+              value: {{ $svc.javaOpts | default "-Xms256m -Xmx512m" | quote }}
+            
+            # 公共中间件环境变量（DB / Redis / MQ / ES / Nacos）
+            {{- include "doj.middleware-env" $ | nindent 12 }}
+            {{- if eq $name "sandbox" }}
+            # 判题运行时镜像仓库前缀（LanguageEnum 拼接 ACR 完整路径）
+
+            - name: DOJ_SANDBOX_IMAGE_PREFIX
+              value: {{ printf "%s/" $.Values.global.imageRegistry | quote }}
+            # 判题代码目录：必须与下方 volumeMounts 的 code-data 挂载点一致
+            - name: DOJ_CODE_PATH
+              value: "/app/data/codes/"
+            # 判题 Job 引用的共享 PVC 名称，与 sandbox.codeStorage.pvcName 保持一致
+            - name: DOJ_CODE_PVC_NAME
+              value: {{ $.Values.sandbox.codeStorage.pvcName | default "doj-code-pvc" | quote }}
+            # 判题 Pod 的 Seccomp 级别（K8sSandboxRunner 读取）：
+            #   RuntimeDefault = containerd 默认 profile（默认，零运维）
+            #   Localhost      = 自定义白名单（需先部署节点 seccomp profile 分发 DaemonSet）
+            - name: DOJ_SANDBOX_SECCOMP_PROFILE
+              value: {{ $.Values.sandbox.seccompProfile | default "RuntimeDefault" | quote }}
+            {{- end }}
+          # ─── 健康检查：探活 + 就绪 ──────────────────────────
+          # livenessProbe:
+          #   httpGet:
+          #     # Spring Boot Actuator 健康端点
+          #     path: /actuator/health
+          #     port: {{ $svc.port }}
+          #   initialDelaySeconds: 60     {{/* 等 Spring 启动完成 */}}
+          #   periodSeconds: 10
+          #   failureThreshold: 3         {{/* 连续 3 次失败 → 重启 Pod */}}
+          # readinessProbe:
+          #   httpGet:
+          #     path: /actuator/health
+          #     port: {{ $svc.port }}
+          #   initialDelaySeconds: 30
+          #   periodSeconds: 5
+          #   failureThreshold: 3         {{/* 连续 3 次失败 → 从 Service 摘除 */}}
+          resources:
+            # ⚠️ 生产环境建议设置明确的 requests/limits
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          {{- if eq $name "sandbox" }}
+          # 判题代码共享卷：sandbox 副本把代码写到 PVC 根 /app/data/codes/<uuid>/，
+          # K8sSandboxRunner 创建的判题 Job 用 subPath=<uuid> 挂载对应子目录
+          volumeMounts:
+            - name: code-data
+              mountPath: /app/data/codes
+          {{- end }}
+      {{- if eq $name "sandbox" }}
+      volumes:
+        - name: code-data
+          persistentVolumeClaim:
+            claimName: {{ $.Values.sandbox.codeStorage.pvcName | default "doj-code-pvc" }}
+      {{- end }}
+
+# ─── Service（集群内部访问，不暴露公网）─────────────────────
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: {{ $name }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ $svc.port }}
+      targetPort: {{ $svc.port }}
+      name: http
+  selector:
+    app: {{ $name }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.agent.enabled }}
+# ═══════════════════════════════════════════════════════════════
+# Agent Service — Python AI 评测服务
+# ═══════════════════════════════════════════════════════════════
+# 功能：接收判题结果 → 调用 DeepSeek/OpenAI 进行 AI 评测
+# 单实例即可（无状态，FastAPI）
+# ═══════════════════════════════════════════════════════════════
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.agent.replicaCount }}
+  selector:
+    matchLabels:
+      app: agent
+  template:
+    metadata:
+      labels:
+        app: agent
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-nacos
+          image: dojacr.azurecr.io/doj/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo ">>> 等待 Nacos 就绪 (http://nacos:{{ $.Values.nacos.port }}/nacos/v1/console/health/readiness)..."
+              until wget -q --spider --timeout=2 http://nacos:{{ $.Values.nacos.port }}/nacos/v1/console/health/readiness 2>/dev/null; do
+                echo ">>> Nacos 未就绪，5秒后重试..."
+                sleep 5
+              done
+              echo ">>> Nacos 已就绪 ✅"
+
+      containers:
+        - name: agent
+          image: {{ .Values.global.imageRegistry }}/{{ .Values.agent.image }}:{{ .Values.global.imageTag }}
+          imagePullPolicy: Always
+          env:
+            # DeepSeek API Key：优先走 Secret（doj-secrets.deepseek-api-key），
+            # 也可通过 --set agent.deepseekApiKey=xxx 临时覆盖
+            - name: DEEPSEEK_API_KEY
+              {{- if .Values.agent.deepseekApiKey }}
+              value: {{ .Values.agent.deepseekApiKey | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: deepseek-api-key
+              {{- end }}
+            # 先同通用 env
+            {{- include "doj.middleware-env" . | nindent 12 }}
+          ports:
+            - containerPort: {{ .Values.agent.port }}
+          # livenessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: {{ .Values.agent.port }}
+          #   initialDelaySeconds: 10
+          #   periodSeconds: 15
+          # readinessProbe:
+          #   httpGet:
+          #     path: /health
+          #     port: {{ .Values.agent.port }}
+          #   initialDelaySeconds: 5
+          #   periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.agent.port }}
+      targetPort: {{ .Values.agent.port }}
+  selector:
+    app: agent
+{{- end }}
+
+{{- if .Values.frontend.enabled }}
+# ═══════════════════════════════════════════════════════════════
+# Frontend Service — Vue 前端（Nginx）
+# ═══════════════════════════════════════════════════════════════
+# 通过 Ingress 暴露到外网，是用户唯一直接访问的入口
+# 内部 API 请求由 Nginx 反向代理到 gateway Service
+# ═══════════════════════════════════════════════════════════════
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doj-fe
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: doj-fe
+spec:
+  replicas: {{ .Values.frontend.replicaCount }}
+  selector:
+    matchLabels:
+      app: doj-fe
+  template:
+    metadata:
+      labels:
+        app: doj-fe
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nginx
+          image: {{ .Values.global.imageRegistry }}/{{ .Values.frontend.image }}:{{ .Values.global.imageTag }}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ .Values.frontend.port }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.frontend.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: doj-fe
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.frontend.port }}
+      targetPort: {{ .Values.frontend.port }}
+  selector:
+    app: doj-fe
+{{- end }}
+
+{{- if .Values.nacos.enabled }}
+# ═══════════════════════════════════════════════════════════════
+# Nacos Service — 注册中心 + 配置中心
+# ═══════════════════════════════════════════════════════════════
+# 数据持久化到 MySQL nacos 库（建库 SQL 在 middleware.yaml ConfigMap）
+# Nacos 启动后自动创建 config_info / users 等内部表（无须手动建表）
+#
+# Nacos 启动流程：
+#   1. init-nacos-conf initContainer 把 nacos 配置写入 emptyDir
+#   2. 主容器读取 /home/nacos/conf/application.properties
+#   3. 连接 MySQL nacos 库，自动建表（schema.sql 硬编码在 nacos-server 中）
+#
+# ⚠️ Nacos 需等待 MySQL 就绪后才能成功启动
+# ═══════════════════════════════════════════════════════════════
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nacos
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: nacos
+spec:
+  replicas: 1                       {{/* 单机模式 */}}
+  selector:
+    matchLabels:
+      app: nacos
+  template:
+    metadata:
+      labels:
+        app: nacos
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # initContainer ①：等待 MySQL 就绪（Nacos 依赖 MySQL 持久化）
+        - name: wait-for-mysql
+          image: {{ .Values.mysql.image }}
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              # ⚠️ 不能用 mysqladmin ping：它只要 mysqld 进程活着就返回 0，
+              #    不校验密码。MySQL 官方镜像 initdb 期间（跑 >1MB 建表 SQL）
+              #    也监听端口 → 会误判"已就绪"，导致 Nacos 提前启动。
+              # 改为真正执行认证 + 校验 nacos 库存在（initdb 建库完成才算就绪）
+              # ① 等待本节点 MySQL 以及 Nacos 数据库初始化完成（最长 120s）
+              for i in $(seq 1 600); do
+                # 使用 SHOW TABLES 检查 nacos 数据库下是否有表
+                if mysql -h 127.0.0.1 -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -e "SHOW TABLES FROM nacos;" 2>/dev/null | grep -q .; then
+                  echo "MySQL 已就绪，且 Nacos 数据库中已有表。"
+                  NACOS_READY=1
+                  break
+                fi
+                sleep 1
+              done
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: mysql-root-password
+        # initContainer ②：生成 Nacos 的 application.properties
+        # 指定数据源为 MySQL，连接信息从 env 获取
+        - name: init-nacos-conf
+          image: dojacr.azurecr.io/doj/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              # ⚠️ 关键：heredoc 不能带引号（<< 'EOF'）！
+              #    带引号会禁用 shell 变量展开，${DB_PASSWORD} 会以字面量写入
+              #    application.properties → Nacos 拿不到真实密码 → 连 MySQL 失败。
+              #    这里必须用 << EOF（不带引号）让 shell 把密码替换进去。
+              cat > /conf/application.properties << EOF
+              # ═══ Nacos 数据源配置（MySQL 持久化）═══
+              # 使用 doj-secrets 中的 MySQL 密码，不硬编码
+              # Nacos 2.2+ 用 spring.sql.init.platform（spring.datasource.platform 已废弃）
+              spring.sql.init.platform=mysql
+              db.num=1
+              # 连接地址指向 mysql-write Service；allowPublicKeyRetrieval 适配 MySQL 8+/9 caching_sha2_password
+              db.url.0=jdbc:mysql://mysql-write:3306/nacos?useSSL=false&characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useUnicode=true&serverTimezone=UTC&allowPublicKeyRetrieval=true
+              db.user.0=root
+              db.password.0=${DB_PASSWORD}
+              EOF
+              # 校验：密码应已被 shell 展开（长度 > 0），且不含字面 ${}
+              PWD_LEN=$(grep '^db.password.0=' /conf/application.properties | cut -d= -f2 | tr -d '\r' | wc -c)
+              echo ">>> application.properties 已生成，db.password.0 长度 = ${PWD_LEN}"
+              if grep -q '\${DB_PASSWORD}' /conf/application.properties; then
+                echo ">>> ❌ 错误：密码未展开，残留字面量 \${DB_PASSWORD}，请检查 heredoc 引号"
+                exit 1
+              fi
+              if [ "${PWD_LEN}" -le 1 ]; then
+                echo ">>> ❌ 错误：db.password.0 为空，请检查 doj-secrets 的 mysql-root-password"
+                exit 1
+              fi
+              
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: mysql-root-password
+            # nacos 鉴权
+            # - name: NACOS_AUTH_ENABLE
+            #   value: "false"
+            # - name: NACOS_AUTH_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: doj-secrets
+            #       key: nacos-auth-token
+          volumeMounts:
+            - name: nacos-conf
+              mountPath: /conf
+
+      containers:
+        - name: nacos
+          image: {{ .Values.nacos.image }}
+          env:
+            - name: MODE
+              value: standalone          {{/* 单机模式 */}}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: mysql-root-password
+            - name: NACOS_AUTH_ENABLE
+              value: "false"
+          ports:
+            - containerPort: {{ .Values.nacos.port }}
+              name: http
+            # gRPC 端口 = 主端口 + 1000（Nacos 2.x 客户端长连接必需，否则 gateway 连 9848 失败）
+            - containerPort: {{ add (.Values.nacos.port | int) 1000 }}
+              name: grpc
+          volumeMounts:
+            # 只覆盖 application.properties，保留镜像自带的其他 conf 文件（nacos-logback.xml 等）
+            - name: nacos-conf
+              mountPath: /home/nacos/conf/application.properties
+              subPath: application.properties
+          livenessProbe:
+            httpGet:
+              path: /nacos/v1/console/health/readiness
+              port: {{ .Values.nacos.port }}
+            initialDelaySeconds: 300     {{/* Nacos 首次启动建表慢，避免被 liveness 误杀 */}}
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /nacos/v1/console/health/readiness
+              port: {{ .Values.nacos.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"      # 限制 Nacos 最多使用 0.2 核 CPU
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: nacos-conf
+          emptyDir: {}
+
+# Nacos Service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nacos
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: nacos
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.nacos.port }}
+      targetPort: {{ .Values.nacos.port }}
+      name: http
+    # gRPC 端口 = 主端口 + 1000（Nacos 2.x 客户端长连接必需）
+    - port: {{ add (.Values.nacos.port | int) 1000 }}
+      targetPort: {{ add (.Values.nacos.port | int) 1000 }}
+      name: grpc
+  selector:
+    app: nacos
+{{- end }}

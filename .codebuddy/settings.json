@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "cicd-automation@codebuddy-plugins-official": true,
+    "github@codebuddy-plugins-official": true
+  }
+}

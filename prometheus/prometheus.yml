@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "doj-services"
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["192.168.163.77:8080"]
+        labels:
+          service: "gateway-service"
+      - targets: ["192.168.163.77:8081"]
+        labels:
+          service: "user-service"
+      - targets: ["192.168.163.77:8082"]
+        labels:
+          service: "sandbox-service"
+      - targets: ["192.168.163.77:8083"]
+        labels:
+          service: "problem-service"
+      - targets: ["192.168.163.77:8084"]
+        labels:
+          service: "submission-service"

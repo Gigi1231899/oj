@@ -1,0 +1,19 @@
+# ═══════════════════════════════════════════════════════════════
+# Sandbox Service — 判题沙箱配置
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: ${doj.port.sandbox-service}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
+doj:
+  sandbox:
+    # ─── 判题执行模式 ────────────────────────────────────
+    # k8s: 使用 K8s Job/Pod 隔离执行判题
+    # docker: 使用 Docker 容器隔离（不推荐 K8s 环境）
+    runner: k8s

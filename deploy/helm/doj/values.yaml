@@ -1,0 +1,298 @@
+# ═══════════════════════════════════════════════════════════════
+# D-OnlineJudge Helm Chart — values.yaml
+# ═══════════════════════════════════════════════════════════════
+# 说明：
+#   - 应用镜像推送到 Azure Container Registry (ACR)，K8s 通过 acr-secret 拉取
+#   - 中间件（MySQL/Redis/RabbitMQ/ES/Nacos）全部 K8s 内部署
+#   - 中间件基础镜像统一上传 ACR，K8s 从 dojacr.azurecr.io/doj/ 拉取
+#   - TLS 终止于 SLB/Ingress，集群内部全 HTTP 明文
+#   - 部署前请先创建 ACR 拉取密钥：
+#     kubectl create secret docker-registry acr-secret \
+#       --docker-server=<ACR_NAME>.azurecr.io \
+#       --docker-username=<ACR_NAME> \
+#       --docker-password=<ACR_PASSWORD> \
+#       -n doj
+# ═══════════════════════════════════════════════════════════════
+
+global:
+  # ─── 镜像仓库（改为此处为你的 ACR 地址）───────────────────────
+  # 示例：dojacr.azurecr.io/doj
+  # build-push.sh 会自动拼接：<imageRegistry>/<服务名>:<imageTag>
+  imageRegistry: dojacr.azurecr.io/doj
+  imageTag: v1.0
+
+  # ─── 镜像拉取密钥 ──────────────────────────────────────────────
+  # 部署前必须手动创建此 Secret，否则 K8s 无法从 ACR 拉取镜像
+  # kubectl create secret docker-registry acr-secret \
+  #   --docker-server=dojacr.azurecr.io \
+  #   --docker-username=dojacr \
+  #   --docker-password=$(az acr credential show -n dojacr --query passwords[0].value -o tsv) \
+  #   -n doj
+  imagePullSecrets:
+    - name: acr-secret
+
+  # ─── 存储类（StorageClass）──────────────────────────────────────
+  # 中间件 PVC 统一使用自定义标准盘 SC（见下方 storageClass 段），
+  # 避免 AKS 默认 managed-csi（PremiumSSD_LRS 高级盘）产生额外费用。
+  # 想切回默认高级盘时改成 managed-csi 即可。
+  storageClass: doj-standard-ssd
+
+  # ─── MySQL — K8s 内部 1 主 1 从 ──────────────────────────────────
+  # writeHost: 主库 Service 名，Java 服务写入通过此地址
+  # readHost:  从库 Service 名，读请求通过此地址
+  # ⚠️ 路由：mysql-write / mysql-read 已通过 statefulset.kubernetes.io/pod-name
+  #    精确指向 mysql-0（主）/ mysql-1（从）
+  # ⚠️ 读写分离由 ShardingSphere-JDBC 实现（Nacos shared-jdbc.yaml）：
+  #    SELECT → readHost（mysql-read），INSERT/UPDATE/DELETE → writeHost（mysql-write）
+  mysql:
+    writeHost: mysql-write # 主库，负责所有写操作
+    readHost: mysql-read # 从库，读操作
+    port: "3306"
+    user: root
+    # password 不走这里，由 doj-secrets 注入，见 templates/secret.yaml
+
+  # ─── Redis — 哨兵模式（高可用）─────────────────────────────────
+  # Sentinel 用 redis-sentinel Service，Sentinel 发现主节点后响应客户端
+  # 连接方式：${redisSentinelNodes} → Sentinel 返回当前主节点地址
+  redisSentinelNodes: redis-sentinel:26379
+  redisMasterName: mymaster # Sentinel 监控的主节点名称
+
+  # ─── RabbitMQ — 消息队列 ────────────────────────────────────────
+  # addresses 支持逗号分隔的多节点地址，客户端自动重连
+  rabbitmqAddresses: rabbitmq:5672
+  rabbitmqUser: guest
+
+  # ─── Elasticsearch — 搜索服务 ──────────────────────────────────
+  elasticsearchUris: http://elasticsearch:9200
+
+  # ─── Nacos — 注册中心 + 配置中心 ────────────────────────────────
+  # Java 服务通过此地址注册到 Nacos 并拉取 shared-*.yaml 配置
+  nacosServer: nacos:8848
+
+# ═══════════════════════════════════════════════════════════════
+# 存储 — 自定义 StorageClass（标准盘省钱）
+# ═══════════════════════════════════════════════════════════════
+
+storageClass:
+  # 是否创建自定义 StorageClass（默认 true）
+  # 已有同名 SC 时 Helm 幂等更新，不会重复创建
+  create: true
+  # Azure 托管磁盘 SKU：
+  #   StandardSSD_LRS = 标准 SSD（推荐，比 Premium 便宜约 60%，测试跑通足够）
+  #   Standard_LRS    = 标准 HDD（最省，但 IO 慢，仅极限省钱场景）
+  skuName: StandardSSD_LRS
+
+# ═══════════════════════════════════════════════════════════════
+# 网络层 — Ingress
+# ═══════════════════════════════════════════════════════════════
+
+ingress:
+  enabled: true
+  className: nginx # 对应 ingress-nginx controller
+  host: ohjudge.asia # ⚠️ 部署时改成你的域名
+  # ─── HTTPS 配置（cert-manager + Let's Encrypt 自动签发）─────────
+  # 前提：集群已装 cert-manager（terraform 管理）且已创建名为 letsencrypt-prod 的 ClusterIssuer
+  # ClusterIssuer 由本 chart 的 templates/cluster-issuer.yaml 自动创建，无需手动 kubectl apply
+  # 证书由 cert-manager 自动申请/续期，secretName 会在集群中自动生成
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt-prod # 自动创建的 ClusterIssuer 名称（两处保持一致）
+    issuerEmail: 2136787055@qq.com # ⚠️ 换成你的真实邮箱（收证书到期提醒，Let's Encrypt 注册用）
+    secretName: ohjudge-tls # cert-manager 会把证书存到这个 Secret
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m" # 允许上传 10MB
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120s" # SSE/长连接超时
+
+# ═══════════════════════════════════════════════════════════════
+# 微服务配置
+# ═══════════════════════════════════════════════════════════════
+# 每个服务通过环境变量（DOJ_DB_HOST 等）获得中间件地址
+# 注册到 Nacos 后，彼此间通过 Service 名内部调用，不经过 Ingress
+# ═══════════════════════════════════════════════════════════════
+
+gateway:
+  enabled: true
+  replicaCount: 2 # 生产环境至少 2 副本
+  image: doj-gateway # 完整路径: <imageRegistry>/doj-gateway:<imageTag>
+  port: 8080
+  javaOpts: "-Xms512m -Xmx512m" # JVM 启动参数
+
+user:
+  enabled: true
+  replicaCount: 2
+  image: doj-user-service
+  port: 8081
+  javaOpts: "-Xms256m -Xmx512m"
+
+problem:
+  enabled: true
+  replicaCount: 2
+  image: doj-problem-service
+  port: 8083
+  javaOpts: "-Xms256m -Xmx512m"
+
+sandbox:
+  enabled: true
+  replicaCount: 2
+  image: doj-sandbox-service
+  port: 8082 # 编译执行沙箱，处理判题任务
+  javaOpts: "-Xms256m -Xmx512m"
+  # 判题 Pod 的 Seccomp 级别：
+  #   RuntimeDefault = containerd 默认 profile（默认，零运维，拦 mount/reboot 等高危 syscall）
+  #   Localhost      = 自定义白名单（更严格，但需先把 profile JSON 分发到每个节点
+  #                    /var/lib/kubelet/seccomp/，可用 DaemonSet 完成）
+  seccompProfile: RuntimeDefault
+  # ─── 判题代码共享存储 ─────────────────────────────────────
+  # sandbox 副本把代码写到 /app/data/codes/<uuid>/，
+  # K8sSandboxRunner 创建的判题 Job 用 subPath=<uuid> 只挂载自己那份子目录
+  # 必须 ReadWriteMany（多 Pod 同时挂），所以 storageClass 用 Azure Files
+  codeStorage:
+    pvcName: doj-code-pvc
+    storageClass: azurefile-csi
+    size: 2Gi
+
+submission:
+  enabled: true
+  # 必须单副本：WebSocket 会话存于进程内内存 Map（SubmissionWSServer.ONLINE_SESSIONS），
+  # 跨 Pod 不共享。多副本时 MQ 消息可能被非会话所在 Pod 消费，导致推送丢失。
+  # 若要恢复多副本，需先实现 Redis/STOMP 会话共享。
+  replicaCount: 1
+  image: doj-submission-service
+  port: 8084
+  javaOpts: "-Xms256m -Xmx512m"
+
+agent:
+  enabled: true
+  replicaCount: 1 # Python Agent，单实例即可
+  image: doj-agent
+  port: 8765
+
+frontend:
+  enabled: true
+  replicaCount: 2
+  image: doj-fe # Vue 前端，打包为 Nginx 静态文件
+  port: 80
+
+# ═══════════════════════════════════════════════════════════════
+# MySQL — 1 主 1 从 (StatefulSet)
+# ═══════════════════════════════════════════════════════════════
+# 镜像说明：
+#   中间件镜像统一上传 ACR（路径 dojacr.azurecr.io/doj/<镜像>:<tag>），
+#   与 build-push.sh / deploy.sh 的 IMAGE_REGISTRY 前缀保持一致
+# 镜像版本说明：
+#   MySQL 8.0.x 是当前长期支持版本，兼容 MySQL 9.x 导出的数据
+#   从 MySQL 9.2 dump 导入 8.0 时注意检查 utf8mb4_0900_ai_ci 排序规则
+# 主容器启动时自动执行 /docker-entrypoint-initdb.d 下的 SQL：
+#   → 创建复制用户 → 建库 → 建表
+# ⚠️ initdb SQL 仅在首次启动（/var/lib/mysql 为空目录）时执行
+#   如果 PVC 已有数据，ConfigMap 中的建库建表 SQL 不会重新运行
+#   如需重新初始化：先删除 PVC → 全量重建 StatefulSet
+# ═══════════════════════════════════════════════════════════════
+
+mysql:
+  enabled: true
+  image: dojacr.azurecr.io/doj/mysql:latest # 本地镜像 swr.cn-north-4.../docker.io/mysql:latest
+  # init-schema 镜像：承载建表 DDL（03-init-tables.sql，>1MB 不能进 ConfigMap）
+  # 由 deploy.sh 构建推送后用 --set mysql.initSchemaImage=<acr>/doj/init-schema:<tag> 覆盖
+  initSchemaImage: dojacr.azurecr.io/doj/init-schema:v1.0 # 本地无 busybox，push 脚本会 docker pull
+  master:
+    persistence:
+      size: 4Gi # 测试阶段最小档（Azure 磁盘最小计费 4GiB）；导入题库后可按需扩容
+  slave:
+    persistence:
+      size: 4Gi
+    replicas: 1
+
+# ═══════════════════════════════════════════════════════════════
+# RabbitMQ — 2 节点集群 + 镜像队列
+# ═══════════════════════════════════════════════════════════════
+# 镜像说明：
+#   - management-alpine 包含 Web 管理插件 + Alpine 基础镜像（体积小）
+#   - guest 账户默认仅限本地连接，K8s 内部 Pod IP 不属 localhost，
+#     如需外部访问 management UI 请通过 Nginx 代理或禁用回环限制
+# 版本说明：
+#   RabbitMQ 3.13 是当前稳定版本，预计 EOL 2025-06
+#   升级 4.0 前确认 Erlang/OTP 兼容性（3.13 需要 OTP 26）
+# ═══════════════════════════════════════════════════════════════
+
+rabbitmq:
+  enabled: true
+  replicaCount: 2
+  image: dojacr.azurecr.io/doj/rabbitmq:3-management # 本地镜像 rabbitmq:3-management
+  servicePort: 5672 # AMQP 协议端口
+  mgmtPort: 15672 # Web 管理界面（不建议暴露公网）
+  mirroredQueuePolicy: |
+    ha-mode=all                        # 所有队列在所有节点镜像
+    ha-sync-mode=automatic             # 自动同步
+  persistence:
+    enabled: true
+    size: 4Gi
+
+# ═══════════════════════════════════════════════════════════════
+# Redis Sentinel — 哨兵高可用模式（3 Sentinel + 1 主 2 从）
+# ═══════════════════════════════════════════════════════════════
+# 架构说明：
+#   - 1 主 2 从 + 3 Sentinel（奇数节点满足 quorum=2 选举多数）
+#   - Sentinel 自动监控主节点，5s 无响应触发 failover
+#   - 应用侧通过 Sentinel 动态发现当前 master，而非直连 Redis Pod IP
+# 镜像说明：
+#   - redis:7-alpine（~30MB）属于 7.x LTS 线，已停止功能更新仅安全修复
+#   - 如需 Redis Stack（JSON/TimeSeries/Bloom），改用 redis/redis-stack-server
+# 持久化建议：
+#   - 当前 PVC 10Gi 用于 RDB 持久化（/data/dump.rdb）
+#   - 建议在 redis.conf 中开启 AOF（appendonly yes）实现混合持久化
+#   - 若数据仅做缓存（可丢失），可关闭持久化以提升写入性能
+# ═══════════════════════════════════════════════════════════════
+
+redis:
+  enabled: true
+  image: dojacr.azurecr.io/doj/redis:alpine # 本地镜像 redis:alpine
+  master:
+    persistence:
+      enabled: true
+      size: 4Gi
+  slaveCount: 2 # 从节点数量
+  sentinelCount: 3 # Sentinel 数量（奇数，保证 quorum 选举）
+  sentinelPort: 26379 # Sentinel 通信端口
+  masterName: mymaster # 主节点在 Sentinel 中的名称
+  downAfterMilliseconds: 5000 # 5 秒判定节点下线
+  failoverTimeout: 10000 # 10 秒故障转移超时
+
+# ═══════════════════════════════════════════════════════════════
+# Elasticsearch — 单节点（开发/小规模使用）
+# ═══════════════════════════════════════════════════════════════
+# 版本说明：
+#   - Helm 部署的是通用 ES 8.15.0（无 IK 中文分词插件）
+#   - 项目根 Dockerfile 构建的是 ES 7.10.2 + IK 分词器自定义镜像，
+#     如果需要 IK 分词，请将 image 改为你构建的自定义镜像地址
+# ⚠️ 生产环境建议用 Azure Elastic Cloud 或升级为 3 节点集群
+# ⚠️ 8.15.0 默认开启 X-Pack Security（需要 TLS 证书），
+#    本部署已通过环境变量 xpack.security.enabled=false 关闭
+# ═══════════════════════════════════════════════════════════════
+
+elasticsearch:
+  enabled: true
+  image: dojacr.azurecr.io/doj/elasticsearch-with-ik:7.10.2 # 本地镜像 elasticsearch-with-ik:7.10.2（含 IK 分词）
+  port: 9200 # HTTP API 端口
+  replicas: 1 # 单节点
+  javaOpts: "-Xms1g -Xmx1g" # ES 至少 1G 堆内存（堆内存不超过物理内存 50%）
+  persistence:
+    enabled: true
+    size: 4Gi
+
+# ═══════════════════════════════════════════════════════════════
+# Nacos — 单机模式 + MySQL 持久化
+# ═══════════════════════════════════════════════════════════════
+# Nacos 启动时会自动创建 config_info 等内部表（如果不存在）
+# 只需提前创建 nacos 数据库（由 MySQL initdb SQL 自动完成）
+# 配置导入：
+#   deploy.sh 部署时会通过 Nacos Open API 自动导入 nacos-configs/ 下
+#   的 shared-*.yaml（dataId + group=DEFAULT_GROUP），无需手动 Web UI 导入。
+#   如需手动：http://<nacos-ip>:8848/nacos → 配置管理 → 导入
+# ═══════════════════════════════════════════════════════════════
+
+nacos:
+  enabled: true
+  image: dojacr.azurecr.io/doj/nacos-server:v2.5.1 # 本地镜像 nacos/nacos-server:v2.5.1
+  mode: standalone # 单机模式（非集群）
+  port: 8848

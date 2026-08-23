@@ -1,0 +1,673 @@
+{{/*
+  ═══════════════════════════════════════════════════════════════
+  D-OnlineJudge — 中间件部署（middleware.yaml）
+  ═══════════════════════════════════════════════════════════════
+  包含四个有状态中间件（与《D-OnlineJudge 中间件配置详解》一一对应）：
+    1. MySQL        — 1 主 1 从 StatefulSet + ShardingSphere 读写分离
+    2. RabbitMQ     — 2 节点 StatefulSet + 镜像队列（ha-mode=all）
+    3. Redis        — 哨兵模式（1 主 2 从 + 3 Sentinel）
+    4. Elasticsearch — 单节点（IK 7.10.2）
+  Nacos 见 services.yaml（随应用一起部署）。
+
+  镜像说明：
+    中间件镜像来自 values.yaml（统一为 dojacr.azurecr.io/doj/<镜像>:<tag>），
+    与 build-push.sh / deploy.sh 的 IMAGE_REGISTRY 前缀保持一致。
+    镜像拉取凭证：global.imagePullSecrets（acr-secret）。
+  ═══════════════════════════════════════════════════════════════
+*/}}
+
+# ═══════════════════════════════════════════════════════════════
+# 1. MySQL — 1 主 1 从 + ShardingSphere 读写分离
+# ═══════════════════════════════════════════════════════════════
+# 架构：
+#   StatefulSet mysql ×2（mysql-0 主 / mysql-1 从）
+#   Service mysql（Headless，稳定 DNS：mysql-0.mysql / mysql-1.mysql）
+#   Service mysql-write（Headless + pod-name=mysql-0，写入口只达主库）
+#   Service mysql-read（Headless + pod-name=mysql-1，读入口只达从库）
+# 应用侧：shared-jdbc.yaml（ShardingSphere-JDBC）SELECT→read / 写→write
+# ═══════════════════════════════════════════════════════════════
+{{- if .Values.mysql.enabled }}
+
+# ─── 初始化 SQL：复制账号 + 建库（<1MB 放 ConfigMap）────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: doj-init-schema
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+data:
+  # 01：复制账号（主从链路专用，仅授权复制权限）
+  01-init-replication.sql: |
+    CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY 'repl123';
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+    FLUSH PRIVILEGES;
+  # 02：建库（业务库 ×3 + Nacos 库）
+  02-init-databases.sql: |
+    CREATE DATABASE IF NOT EXISTS doj_user DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+    CREATE DATABASE IF NOT EXISTS doj_problem DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+    CREATE DATABASE IF NOT EXISTS doj_submission DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+    CREATE DATABASE IF NOT EXISTS nacos DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+  # 03 建表 DDL（03-init-tables.sql >1MB 超出 ConfigMap 上限，
+  # 由 deploy/init-schema 镜像承载，见 initContainer 第二步）
+---
+# ─── Headless Service：StatefulSet serviceName 绑定，稳定 DNS ──
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  clusterIP: None                # Headless：DNS 返回后端所有 Pod IP
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+# ─── 写入口：精确指向 mysql-0（主库）────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-write
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+    statefulset.kubernetes.io/pod-name: mysql-0
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+# ─── 读入口：精确指向 mysql-1（从库）────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+    statefulset.kubernetes.io/pod-name: mysql-1
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  serviceName: mysql
+  replicas: {{ add 1 (int .Values.mysql.slave.replicas | default 1) }}  # 1 主 + 1 从
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+        {{- include "doj.labels" . | nindent 8 }}
+    spec:
+      # 【ACR】私有仓库拉取凭证
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      initContainers:
+        # Step 2：注入初始化 SQL——ConfigMap（复制账号+建库）+ init-schema 镜像（建表 DDL）
+        # 主容器把 /init-scripts 挂到 /docker-entrypoint-initdb.d，
+        # MySQL 官方 entrypoint 在数据目录为空时按文件名顺序执行全部 .sql
+        - name: init-mysql-sql
+          image: {{ .Values.mysql.initSchemaImage }}
+          imagePullPolicy: Always
+          command: [sh, -c]
+          args:
+            - cp /configmap/*.sql /init-scripts/ && cp /sql/03-init-tables.sql /init-scripts/ && cp /sql/nacos.sql /init-scripts/ && ls -la /init-scripts/
+          volumeMounts:
+            - {name: sql-config,    mountPath: /configmap}     # ConfigMap（只读）
+            - {name: init-scripts,  mountPath: /init-scripts}  # emptyDir 中转
+      containers:
+        - name: mysql
+          image: {{ .Values.mysql.image }}
+          imagePullPolicy: Always
+          # Step 3：动态 server-id + 显式 binlog（覆盖官方 entrypoint）
+          # MySQL 官方镜像不读 SERVER_ID 环境变量；从 HOSTNAME（mysql-0）取序号，
+          # server-id = 序号+1 保证全集群唯一，避免复制死循环
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              SERVER_ID=$((10#$ORDINAL + 1))
+              printf '[mysqld]\nserver-id=%s\nlog-bin=mysql-bin\nbinlog-format=ROW\nrelay-log=mysql-relay-bin\n' "${SERVER_ID}" > /etc/mysql/conf.d/replication.cnf
+              exec docker-entrypoint.sh mysqld
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: mysql-root-password
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - {name: mysql, containerPort: 3306}
+          # MySQL 就绪探针：mysqld 真正接受连接才标记 Ready
+          # （Nacos 的 wait-for-mysql initContainer 依赖此就绪状态）
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - mysqladmin ping -h 127.0.0.1 -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          # Step 4：postStart 主从身份分工（与 mysqld 并行触发，先轮询就绪）
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -ec
+                  - |
+                    # ① 等待本节点 MySQL 就绪（最长 120s）
+                    for i in $(seq 1 120); do
+                      mysqladmin ping -h 127.0.0.1 -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent && break
+                      sleep 1
+                    done
+                    if [ "${POD_NAME}" = "mysql-0" ]; then
+                      # ── 主节点：幂等创建复制账号（与 01-init-replication.sql 双保险）──
+                      mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "
+                        CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY 'repl123';
+                        GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';
+                        FLUSH PRIVILEGES;"
+                    else
+                      # ── 从节点：加入复制链路 ──
+                      # ② 轮询主库 repl 账号可连（最长 3 分钟；主库 initdb 可能未完成）
+                      for i in $(seq 1 180); do
+                        mysql -h mysql-0.mysql -urepl -prepl123 -e "SELECT 1" --connect-timeout=2 >/dev/null 2>&1 && break
+                        sleep 1
+                      done
+                      # ③ 幂等：已复制则跳过（Pod 重启不重复配置）
+                      if mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "SHOW REPLICA STATUS\G" 2>/dev/null | grep -q "Replica_IO_Running: Yes"; then
+                        exit 0
+                      fi
+                      # ④ 取主库当前 binlog 位点（全新空库，从当前位点复制增量）
+                      MASTER_STATUS=$(mysql -h mysql-0.mysql -urepl -prepl123 -e "SHOW BINARY LOG STATUS" --connect-timeout=2)
+                      MASTER_LOG_FILE=$(echo "${MASTER_STATUS}" | awk 'NR==2{print $1}')
+                      MASTER_LOG_POS=$(echo "${MASTER_STATUS}" | awk 'NR==2{print $2}')
+                      # ⑤ CHANGE REPLICATION SOURCE + START REPLICA（MySQL 9.x 已移除 MASTER/SLAVE 旧语法）
+                      mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "
+                        STOP REPLICA;
+                        RESET REPLICA ALL;
+                        CHANGE REPLICATION SOURCE TO
+                          SOURCE_HOST='mysql-0.mysql',
+                          SOURCE_PORT=3306,
+                          SOURCE_USER='repl',
+                          SOURCE_PASSWORD='repl123',
+                          SOURCE_LOG_FILE='${MASTER_LOG_FILE}',
+                          SOURCE_LOG_POS=${MASTER_LOG_POS};
+                        START REPLICA;"
+                    fi
+          volumeMounts:
+            - {name: init-scripts, mountPath: /docker-entrypoint-initdb.d}
+            - {name: data,         mountPath: /var/lib/mysql}
+      # 数据卷：每 Pod 独立 PVC（data-mysql-0 / data-mysql-1）
+      volumes:
+        - name: sql-config
+          configMap:
+            name: doj-init-schema
+        - name: init-scripts
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: {{ .Values.global.storageClass }}
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.mysql.master.persistence.size | default "4Gi" }}
+{{- end }}
+---
+# ═══════════════════════════════════════════════════════════════
+# 2. RabbitMQ — 2 节点集群 + 镜像队列
+# ═══════════════════════════════════════════════════════════════
+# 架构：
+#   StatefulSet rabbitmq ×2（rabbitmq-0 主 / rabbitmq-1 join_cluster 加入）
+#   Service rabbitmq（Headless，DNS 返回双 IP，应用自行选择一个节点连接）
+#   postStart：rabbitmq-0 设镜像队列策略 ha-mode=all，rabbitmq-1 加入集群
+# ═══════════════════════════════════════════════════════════════
+{{- if .Values.rabbitmq.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  clusterIP: None                # Headless：供集群节点互发现 + 应用连接
+  selector:
+    app: rabbitmq
+  ports:
+    - {name: amqp,        port: {{ .Values.rabbitmq.servicePort | default 5672 }},  targetPort: amqp}
+    - {name: management,  port: {{ .Values.rabbitmq.mgmtPort | default 15672 }}, targetPort: management}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  serviceName: rabbitmq
+  replicas: {{ .Values.rabbitmq.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+        {{- include "doj.labels" . | nindent 8 }}
+    spec:
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      containers:
+        - name: rabbitmq
+          image: {{ .Values.rabbitmq.image }}
+          imagePullPolicy: IfNotPresent
+          # Step 1：Erlang 集群节点命名（长主机名 FQDN + 统一 Cookie）
+          env:
+            # POD_NAME/POD_NAMESPACE 必须放在 RABBITMQ_NODENAME 之前，
+            # 否则 K8s 的 $(VAR) 引用不会展开（会原样留下 $(POD_NAME) 导致 nxdomain）
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RABBITMQ_NODENAME
+              value: rabbit@$(POD_NAME).rabbitmq.$(POD_NAMESPACE).svc.cluster.local
+            - name: RABBITMQ_USE_LONGNAME
+              value: "true"
+            - name: RABBITMQ_ERLANG_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: rabbitmq-erlang-cookie
+            - name: RABBITMQ_DEFAULT_USER
+              value: {{ .Values.global.rabbitmqUser | default "guest" | quote }}
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: doj-secrets
+                  key: rabbitmq-password
+          ports:
+            - {name: amqp,        containerPort: 5672}
+            - {name: management,  containerPort: 15672}
+            - {name: epmd,        containerPort: 4369}
+            - {name: clustering,  containerPort: 25672}
+          # Step 2：postStart 主从分工（先 wait 本节点就绪）
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    # 失败不杀容器（postStart 失败会导致 CrashLoop，这里全部容忍）
+                    rabbitmqctl wait --timeout 60 || true
+                    if [ "${POD_NAME}" = "rabbitmq-0" ]; then
+                      # ── 主节点：统一启用功能标记 + 镜像队列策略 ──
+                      rabbitmqctl enable_feature_flag all_policies || true
+                      rabbitmqctl set_policy ha-all ".*" '{"ha-mode":"all","ha-sync-mode":"automatic"}' --apply-to all || true
+                    else
+                      # ── 从节点：停止应用 → join_cluster → 启动 ──
+                      rabbitmqctl stop_app || true
+                      rabbitmqctl join_cluster rabbit@rabbitmq-0.rabbitmq.${POD_NAMESPACE}.svc.cluster.local || true
+                      rabbitmqctl start_app || true
+                    fi
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/rabbitmq}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: {{ .Values.global.storageClass }}
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.rabbitmq.persistence.size | default "4Gi" }}
+{{- end }}
+---
+# ═══════════════════════════════════════════════════════════════
+# 3. Redis — 哨兵模式（1 主 2 从 + 3 Sentinel）
+# ═══════════════════════════════════════════════════════════════
+# 架构：
+#   redis-master StatefulSet ×1 + redis-slave StatefulSet ×{{ .Values.redis.slaveCount }}
+#   redis-sentinel Deployment ×{{ .Values.redis.sentinelCount }}（奇数满足 quorum）
+#   Service redis-master / redis-slave：Headless（从库 --replicaof 用 FQDN 寻址）
+#   Service redis-sentinel：普通 ClusterIP（客户端经虚拟 IP 负载均衡）
+# 应用侧：shared-redis.yaml 连 redis-sentinel:26379，Sentinel 动态返回当前主节点
+# ═══════════════════════════════════════════════════════════════
+{{- if .Values.redis.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+data:
+  # redis.conf：master/slave 共用（slave 追加 --replicaof 参数）
+  redis.conf: |
+    bind 0.0.0.0
+    protected-mode no
+    port 6379
+    save 900 1
+    save 300 10
+    save 60 10000
+    appendonly yes
+    replica-read-only yes
+    replica-priority 100
+  # sentinel.conf：监控 master，quorum=2 才触发故障转移
+  sentinel.conf: |
+    # K8s 内用 FQDN 寻址 master（IP 会随 Pod 重启变化），必须开启主机名解析
+    sentinel resolve-hostnames yes
+    sentinel monitor {{ .Values.redis.masterName | default "mymaster" }} redis-master-0.redis-master.{{ .Release.Namespace }}.svc.cluster.local 6379 {{ div (int (add .Values.redis.sentinelCount 1)) 2 }}
+    sentinel down-after-milliseconds {{ .Values.redis.masterName | default "mymaster" }} {{ .Values.redis.downAfterMilliseconds | default 5000 }}
+    sentinel failover-timeout {{ .Values.redis.masterName | default "mymaster" }} {{ .Values.redis.failoverTimeout | default 10000 }}
+    sentinel parallel-syncs {{ .Values.redis.masterName | default "mymaster" }} 1
+---
+# ─── Master：Headless（供 slave 的 --replicaof 用 FQDN 寻址）────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+    role: master
+  ports:
+    - {name: redis, port: 6379, targetPort: redis}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-master
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  serviceName: redis-master
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      role: master
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: master
+        {{- include "doj.labels" . | nindent 8 }}
+    spec:
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: IfNotPresent
+          command: [redis-server, /etc/redis/redis.conf]
+          ports:
+            - {name: redis, containerPort: 6379}
+          volumeMounts:
+            - {name: config, mountPath: /etc/redis}
+            - {name: data,   mountPath: /data}
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+            items:
+              - {key: redis.conf, path: redis.conf}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: {{ .Values.global.storageClass }}
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.redis.master.persistence.size | default "4Gi" }}
+---
+# ─── Slave：Headless（供 Sentinel 发现从节点）───────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-slave
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+    role: slave
+  ports:
+    - {name: redis, port: 6379, targetPort: redis}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-slave
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  serviceName: redis-slave
+  replicas: {{ .Values.redis.slaveCount | default 2 }}
+  selector:
+    matchLabels:
+      app: redis
+      role: slave
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: slave
+        {{- include "doj.labels" . | nindent 8 }}
+    spec:
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: IfNotPresent
+          # 追加 --replicaof：精确指向 redis-master-0（不能用 redis-master Service 名，
+          # Headless 会解析出全部副本 IP）
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
+            - --replicaof
+            - redis-master-0.redis-master.{{ .Release.Namespace }}.svc.cluster.local
+            - "6379"
+          ports:
+            - {name: redis, containerPort: 6379}
+          volumeMounts:
+            - {name: config, mountPath: /etc/redis}
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+            items:
+              - {key: redis.conf, path: redis.conf}
+---
+# ─── Sentinel：Deployment ×3（无状态，奇数满足 quorum=2）──────
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  # 普通 ClusterIP：客户端经虚拟 IP 负载均衡到任意哨兵（无需 Headless）
+  selector:
+    app: redis
+    role: sentinel
+  ports:
+    - {name: sentinel, port: {{ .Values.redis.sentinelPort | default 26379 }}, targetPort: sentinel}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-sentinel
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.redis.sentinelCount | default 3 }}
+  selector:
+    matchLabels:
+      app: redis
+      role: sentinel
+  template:
+    metadata:
+      labels:
+        app: redis
+        role: sentinel
+        {{- include "doj.labels" . | nindent 8 }}
+    spec:
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      containers:
+        - name: redis-sentinel
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: IfNotPresent
+          # Sentinel 需要回写配置（持久化主从状态），ConfigMap 只读，先拷贝到可写目录再启动
+          command: ["sh", "-c", "cp /etc/redis/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+          ports:
+            - {name: sentinel, containerPort: {{ .Values.redis.sentinelPort | default 26379 }}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/redis}
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+            items:
+              - {key: sentinel.conf, path: sentinel.conf}
+{{- end }}
+---
+# ═══════════════════════════════════════════════════════════════
+# 4. Elasticsearch — 单节点（IK 7.10.2）
+# ═══════════════════════════════════════════════════════════════
+# 架构：
+#   StatefulSet elasticsearch ×1 + Service elasticsearch（普通 ClusterIP）
+#   单节点无集群互发现需求，Headless 非必需；serviceName 仅用于 PVC 命名
+#   discovery.type=single-node 跳过选主；关闭 xpack 免 TLS 证书
+#   node.store.allow_mmap=false 规避 vm.max_map_count 宿主限制
+# ═══════════════════════════════════════════════════════════════
+{{- if .Values.elasticsearch.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  # 普通 ClusterIP（非 Headless）
+  selector:
+    app: elasticsearch
+  ports:
+    - {name: http,       port: 9200, targetPort: http}
+    - {name: transport,  port: 9300, targetPort: transport}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "doj.labels" . | nindent 4 }}
+spec:
+  serviceName: elasticsearch
+  replicas: {{ .Values.elasticsearch.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        {{- include "doj.labels" . | nindent 8 }}
+    spec:
+      imagePullSecrets:
+        {{- toYaml .Values.global.imagePullSecrets | nindent 8 }}
+      initContainers:       # ← ② 新增整个 initContainers 部分
+        - name: fix-permissions
+          image: dojacr.azurecr.io/doj/busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo ">>> 修复 Elasticsearch 数据目录权限..."
+              chown -R 1000:1000 /usr/share/elasticsearch/data
+              echo ">>> 权限修复完成 ✅"
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+          securityContext:
+            runAsUser: 0
+      containers:
+        - name: elasticsearch
+          image: {{ .Values.elasticsearch.image }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: xpack.security.enabled
+              value: "false"
+            - name: ES_JAVA_OPTS
+              value: {{ .Values.elasticsearch.javaOpts | default "-Xms1g -Xmx1g" | quote }}
+            - name: node.store.allow_mmap
+              value: "false"
+          ports:
+            - {name: http,       containerPort: 9200}
+            - {name: transport,  containerPort: 9300}
+          volumeMounts:
+            - {name: data, mountPath: /usr/share/elasticsearch/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: {{ .Values.global.storageClass }}
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.elasticsearch.persistence.size | default "4Gi" }}
+{{- end }}

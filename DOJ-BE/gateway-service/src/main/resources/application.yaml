@@ -1,0 +1,88 @@
+# ═══════════════════════════════════════════════════════════════
+# Gateway Service — 本地开发配置
+# ═══════════════════════════════════════════════════════════════
+# K8s 部署时：
+#   - server.port 由 env DOJ_PORT_GATEWAY 覆盖
+#   - Nacos 地址由 env DOJ_NACOS_SERVER_ADDR 覆盖
+#   - 仅通过 spring.config.import 从 Nacos 拉取 shared-jwt.yaml（鉴权配置）
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: ${doj.port.gateway-service}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
+spring:
+  profiles:
+    active: common
+  autoconfigure:
+    exclude:
+      # gateway 只做 JWT 鉴权 + 路由，不使用 Redis/RabbitMQ。
+      # 根 pom 全局引入了 data-redis/amqp，导致自动配置去连 localhost:6379/5672，
+      # health 报 DOWN 被 K8s liveness 探针杀掉（CrashLoopBackOff）。
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisReactiveAutoConfiguration
+      - org.springframework.boot.autoconfigure.amqp.RabbitAutoConfiguration
+  cloud:
+    gateway:
+      routes:
+        - id: user
+          uri: lb://user-service
+          predicates:
+            - Path=/user/**
+        - id: problem
+          uri: lb://problem-service
+          predicates:
+            - Path=/problem/**
+        - id: submission
+          uri: lb://submission-service
+          predicates:
+            - Path=/submission/**
+        - id: sandbox
+          uri: lb://sandbox-service
+          predicates:
+            - Path=/sandbox/**
+        # AI 助手：/chat/** 由 sandbox-service 的 ChatController 代理转发到 Python Agent（agent:8765）
+        - id: chat
+          uri: lb://sandbox-service
+          predicates:
+            - Path=/chat/**
+# spring:
+#   cloud:
+#     sentinel:
+#       transport:
+#         # ⚠️ K8s 环境通过 env SENTINEL_DASHBOARD_ADDR 覆盖
+#         # 本地开发可设为 localhost:8858
+#         dashboard: ${SENTINEL_DASHBOARD_ADDR:sentinel:8858}
+#       datasource:
+#         # Sentinel 流控规则存储在 Nacos 中
+#         ds1:
+#           nacos:
+#             server-addr: ${spring.cloud.nacos.server-addr}
+#             data-id: gateway-sentinel-rules
+#             group-id: DEFAULT_GROUP
+#             data-type: json
+#             rule-type: flow
+#         # Sentinel 降级规则
+#         degrade:
+#           nacos:
+#             server-addr: ${spring.cloud.nacos.server-addr}
+#             data-id: gateway-sentinel-degrade-rules
+#             group-id: DEFAULT_GROUP
+#             data-type: json
+#             rule-type: degrade
+
+doj:
+  auth:
+    # ─── 网关鉴权白名单 ────────────────────────────────────
+    # 以下路径不校验 JWT Token
+    excludePaths:
+      - /
+      - /static/**
+      - /user/login
+      - /user/register
+      - /user/refresh

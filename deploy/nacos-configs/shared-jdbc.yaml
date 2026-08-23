@@ -1,0 +1,99 @@
+# ═══════════════════════════════════════════════════════════════
+# Nacos 共享配置 — JDBC 读写分离（ShardingSphere-JDBC 5.2.1）
+# ═══════════════════════════════════════════════════════════════
+# Data ID: shared-jdbc.yaml / Group: DEFAULT_GROUP
+#
+# 原理：ShardingSphere-JDBC 在 JDBC 层拦截 SQL，解析后自动路由
+#   SELECT                → slave（mysql-read，从库）
+#   INSERT/UPDATE/DELETE  → master（mysql-write，主库）
+#
+# 依赖（已加入 DOJ-BE 根 pom，user/problem/submission 三个服务引入）：
+#   org.apache.shardingsphere:shardingsphere-jdbc-core-spring-boot-starter:5.2.1
+#
+# ⚠️ 版本注意：5.2.1 的 Mode 配置格式是 spring.shardingsphere.mode.type，
+#    千万别写成 5.3.x 的顶层 spring.shardingsphere.type（5.2.1 不识别，
+#    Mode 初始化失败 → 数据源无法创建 → 服务启动即 exit 1）
+# ⚠️ repository.type 必须是 JDBC（5.2.1 唯一内置实现，H2 内存库）！
+#    写 File 会报 SPI-00001: No implementation class load from SPI
+#    StandalonePersistRepository with type File（5.2.1 没有 File 实现）
+# ⚠️ 读写分离规则格式：5.2.1 必须用 static-strategy/dynamic-strategy，
+#    千万别写 5.3.x 的 type: Static + props（5.2.1 不识别这两个字段，
+#    规则绑定为空 → 启动报 No available readwrite-splitting rule configuration）
+#
+# 占位符说明：
+#   ${doj.db.name}                库名，各服务在 application.yaml 中定义
+#                                 （doj_user / doj_problem / doj_submission）
+#   ${DOJ_DB_USER:root}           用户名，K8s env DOJ_DB_USER（values.yaml）
+#   ${DOJ_DB_PASSWORD}            密码，K8s env DOJ_DB_PASSWORD（Secret，_helpers.tpl 注入）
+#   ${DOJ_DB_MASTER_HOST:mysql-write}  主库 Service 名（K8s 内固定，可 env 覆盖）
+#   ${DOJ_DB_SLAVE_HOST:mysql-read}    从库 Service 名（同上）
+#
+# 注意：
+#   - 旧 shared-jdbc-read.yaml 已删除：其 spring.datasource.read.* 是
+#     Spring Boot 不认识的属性，无法生效；读写分离统一由本文件的
+#     readwrite-splitting 规则完成（slave 即读库）
+#   - 排障：把 props.sql-show 改为 true，应用日志会打印真实路由 SQL
+# ═══════════════════════════════════════════════════════════════
+
+spring:
+  # ─── Elasticsearch（仅 problem-service 使用，user/submission 无此依赖）───
+  # ⚠️ 此段原本在 problem-service 的 application.yaml 里被注释掉了，
+  #    Spring 因而走了默认 http://localhost:9200 → pod 内 Connection refused。
+  #    放在这里由 Nacos 统一提供；K8s env DOJ_ELASTICSEARCH_URIS 覆盖默认值
+  elasticsearch:
+    uris: ${DOJ_ELASTICSEARCH_URIS:http://elasticsearch:9200}
+  shardingsphere:
+    mode:
+      type: Standalone
+      repository:
+        type: JDBC
+        props:
+          jdbc-url: jdbc:h2:mem:config;DB_CLOSE_DELAY=-1;DATABASE_TO_UPPER=false;MODE=MYSQL
+          username: sa
+          password: ""
+    props:
+      sql-show: false # true 时打印真实路由 SQL（排障用）
+    datasource:
+      names: master, slave
+      master:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://${DOJ_DB_MASTER_HOST:mysql-write}:3306/${doj.db.name}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true
+        username: ${DOJ_DB_USER:root}
+        password: ${DOJ_DB_PASSWORD}
+        maximum-pool-size: 10
+        minimum-idle: 5
+        connection-timeout: 20000
+        connection-test-query: select 1
+        auto-commit: true
+      slave:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://${DOJ_DB_SLAVE_HOST:mysql-read}:3306/${doj.db.name}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true
+        username: ${DOJ_DB_USER:root}
+        password: ${DOJ_DB_PASSWORD}
+        maximum-pool-size: 10
+        minimum-idle: 5
+        connection-timeout: 20000
+        connection-test-query: select 1
+        auto-commit: true
+    rules:
+      readwrite-splitting:
+        data-sources:
+          doj_rw:
+            # ⚠️ 5.2.1 用 static-strategy（5.3.0+ 才改为 type: Static + props，
+            #    写 type/props 会绑定失败 → 报 No available readwrite-splitting rule）
+            static-strategy:
+              write-data-source-name: master
+              read-data-source-names: slave
+            load-balancer-name: round_robin
+        load-balancers:
+          round_robin:
+            type: ROUND_ROBIN
+
+# ─── MyBatis-Plus 全局配置 ─────────────────────────────────────
+mybatis-plus:
+  global-config:
+    db-config:
+      update-strategy: not_null # 只更新非 null 字段（避免误清空）
+      id-type: auto # 主键自增

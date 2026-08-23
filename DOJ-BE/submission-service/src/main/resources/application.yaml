@@ -1,0 +1,18 @@
+# ═══════════════════════════════════════════════════════════════
+# Submission Service — 提交/判题服务配置
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: ${doj.port.submission-service}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
+# ─── 数据库库名（K8s 与本地共用）───────────────────────────
+# Nacos shared-jdbc.yaml 的 ${doj.db.name} 引用此值
+doj:
+  db:
+    name: doj_submission

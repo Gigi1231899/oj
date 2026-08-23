@@ -1,0 +1,36 @@
+# ═══════════════════════════════════════════════════════════════
+# User Service — 本地开发配置
+# ═══════════════════════════════════════════════════════════════
+# K8s 部署时：
+#   - server.port 由 env DOJ_PORT_USER 覆盖
+#   - DB 连接从 Nacos shared-jdbc.yaml 拉取（K8s Service 名）
+#   - 不需要在本地文件写 127.0.0.1
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: ${doj.port.user-service}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
+# ─── 数据库库名（K8s 与本地共用）───────────────────────────
+# Nacos shared-jdbc.yaml 的 ${doj.db.name} 引用此值
+doj:
+  db:
+    name: doj_user
+
+# ─── 本地开发时取消注释下面配置 ──────────────────────────
+# ⚠️ 注意：K8s 环境由 Nacos shared-jdbc.yaml 提供配置
+# 本地开发示例：
+# doj:
+#     db:
+#         host: ${DOJ_DB_HOST:mysql-write}    ← K8s Service 名，非 127.0.0.1
+#         name: doj_user
+#         user: ${DOJ_DB_USER:root}
+#         pwd: ${DOJ_DB_PWD:123}
+#     swagger:
+#         title: 用户服务接口文档
+#         scan: com.decade.doj.user.controller

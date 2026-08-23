@@ -1,0 +1,83 @@
+{{/*
+  ═══════════════════════════════════════════════════════════════
+  D-OnlineJudge — Ingress 入口配置
+  ═══════════════════════════════════════════════════════════════
+  路由规则：
+    /            → doj-fe (Vue 前端，静态文件)
+    /api/        → gateway (Spring Cloud Gateway，后端入口)
+    
+  
+  前提条件：
+    - 集群已安装 ingress-nginx controller
+    - DNS A 记录指向 Ingress Controller 的 LoadBalancer 公网 IP
+    - TLS 证书（如有）通过 cert-manager 管理，不在此文件配置
+  
+  获取公网 IP：
+    kubectl get svc ingress-nginx-controller -n ingress-nginx
+  ═══════════════════════════════════════════════════════════════
+*/}}
+
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: doj-ingress
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # Ingress 类名，对应 ingress-nginx controller
+    kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
+    # ⚠️ 关键：剥离 /api 前缀再转发给网关。
+    #    前端所有请求带 /api（VITE_APP_URL=/api），而网关路由是 Path=/user/** 等
+    #    （不带 /api）。不剥的话网关收到 /api/user/register 匹配不到任何路由 → 404。
+    #    $2 引用下方路径正则的第 2 个捕获组：
+    #      - /api(/|$)(.*) → $2 = 去掉 /api 后的路径，如 user/register
+    #      - /()(.*)        → $2 = 完整路径（$1 空组占位），前端静态资源不受影响
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    # 允许上传最大 10MB（代码提交场景）
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # 读超时 3600 秒（判题 WS 长连接需要：判题可能耗时数分钟，
+    #    超时过短会在结果返回前掐断 WS，导致推送丢失。SSE 长连接同样受益）
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600s"
+    # 写超时同上
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600s"
+    # 启用 WebSocket 支持
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+    {{- if .Values.ingress.tls.enabled }}
+    # cert-manager 自动签发 Let's Encrypt 证书（集群内需先安装 cert-manager + ClusterIssuer）
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer | quote }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          # ─── 后端网关（/api/ 前缀 → gateway，$2 剥掉 /api/）───
+          # ⚠️ 必须放在前端规则之前（nginx 正则 location 按顺序匹配，先匹配先生效）
+          #    用 ImplementationSpecific + 正则才能提供捕获组供 rewrite-target 引用
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080
+
+          # ─── 前端（/()(.*) 捕获组对齐 rewrite-target 的 $2）───
+          #    不能再用 / Prefix：会被 rewrite-target 一起处理导致静态资源 404
+          - path: /()(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: doj-fe
+                port:
+                  number: 80
+
+          
+{{- end }}

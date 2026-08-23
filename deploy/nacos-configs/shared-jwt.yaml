@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════════════════════════════
+# Nacos 共享配置 — JWT 鉴权
+# ═══════════════════════════════════════════════════════════════
+# Data ID: shared-jwt.yaml
+# Group: DEFAULT_GROUP
+#
+# 绑定类：JwtProperties（@ConfigurationProperties(prefix = "doj.jwt")）
+# 签名算法：RS256（需要 JKS 密钥库文件）
+# ⚠️ 生产环境需通过环境变量覆盖敏感值
+# ═══════════════════════════════════════════════════════════════
+
+doj:
+  jwt:
+    # ─── JKS 密钥库（用于 RS256 签名/验证）──────────────────
+    # location：classpath:doj.jks 表示从 jar 包 classpath 加载
+    # 如果 JKS 放在 K8s Secret 挂载目录，改为 file:/etc/secrets/doj.jks
+    location: ${DOJ_JWT_LOCATION:classpath:doj.jks}
+    # 密钥别名
+    alias: ${DOJ_JWT_ALIAS:decade}
+    # 密钥库密码（⚠️ 生产环境务必修改）
+    password: ${DOJ_JWT_PASSWORD:doj123}
+
+    # ─── Token 有效期 ────────────────────────────────────────
+    # access token 短效（用户登录后的短期凭证）
+    tokenTTL: ${DOJ_JWT_ACCESS_TTL:30m}
+    # refresh token 长效（用于无感续期，默认 7 天可不配）
+    refreshTokenTTL: ${DOJ_JWT_REFRESH_TTL:7d}
+
+    # ─── 请求头/内部传递 ──────────────────────────────────────
+    # 客户端请求头名（前端携带 JWT 的 header 名）
+    authorization: ${DOJ_JWT_AUTHORIZATION:authorization}
+    # 微服务间传递 userId 的内部请求头名（Gateway → 后端服务）
+    secret-key: ${DOJ_JWT_SECRET_KEY:uid}

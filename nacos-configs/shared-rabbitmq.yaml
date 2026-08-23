@@ -1,0 +1,31 @@
+# ============================================================
+# RabbitMQ 镜像集群
+# 原理：addresses 填多个节点，客户端随机连一个，挂了自动切
+#       "镜像队列"是 RabbitMQ 服务端策略——消息写入后自动同步
+#       到所有节点，任何节点都有完整消息副本
+# 镜像队列需要进 RabbitMQ 执行一次（进任意节点）：
+#   rabbitmqctl set_policy ha-all "^doj\\." \
+#     '{"ha-mode":"all","ha-sync-mode":"automatic"}'
+# ============================================================
+spring:
+  rabbitmq:
+    addresses: ${DOJ_MQ_ADDRESSES:127.0.0.1:5672}
+    username: ${DOJ_MQ_USER:guest}
+    password: ${DOJ_MQ_PWD:guest}
+    connection-timeout: 5000ms
+    requested-heartbeat: 30s
+    listener:
+      simple:
+        prefetch: 1
+        concurrency: 2
+        max-concurrency: 5
+        acknowledge-mode: manual
+        retry:
+          enabled: true
+          initial-interval: 2000ms
+          max-attempts: 3
+          multiplier: 2.0
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true

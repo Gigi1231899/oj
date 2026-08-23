@@ -1,0 +1,22 @@
+.idea/
+*.iml
+.DS_Store
+**/.DS_Store
+.vscode/
+/target/
+/DOJ-BE/target/
+/DOJ-BE/.idea/
+/DOJ-FE/node_modules/
+/DOJ-FE/dist/
+/terraform/.terraform/
+# Ignore local data and static files
+redis/
+nacos/
+mysql/
+static/
+elasticsearch/
+GEMINI.md
+
+skywalking-agent/
+
+.secrets

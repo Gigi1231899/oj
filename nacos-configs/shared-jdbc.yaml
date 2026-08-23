@@ -1,0 +1,79 @@
+# ═══════════════════════════════════════════════════════════════
+# Nacos 共享配置 — JDBC 读写分离（ShardingSphere-JDBC 5.3.2）
+# ═══════════════════════════════════════════════════════════════
+# Data ID: shared-jdbc.yaml / Group: DEFAULT_GROUP
+#
+# ⚠️ 发布源在 deploy/nacos-configs/shared-jdbc.yaml，此处为同步副本，
+#    修改请以 deploy 目录为准（部署时导入 Nacos 的也是那份）。
+#
+# 原理：ShardingSphere-JDBC 在 JDBC 层拦截 SQL，解析后自动路由
+#   SELECT                → slave（mysql-read，从库）
+#   INSERT/UPDATE/DELETE  → master（mysql-write，主库）
+#
+# 依赖（已加入 DOJ-BE 根 pom，user/problem/submission 三个服务引入）：
+#   org.apache.shardingsphere:shardingsphere-jdbc-core-spring-boot-starter:5.3.2
+#
+# 占位符说明：
+#   ${doj.db.name}                库名，各服务在 application.yaml 中定义
+#                                 （doj_user / doj_problem / doj_submission）
+#   ${DOJ_DB_USER:root}           用户名，K8s env DOJ_DB_USER（values.yaml）
+#   ${doj.db.password:123}        密码，K8s env DOJ_DB_PASSWORD（Secret）
+#   ${DOJ_DB_MASTER_HOST:mysql-write}  主库 Service 名（K8s 内固定，可 env 覆盖）
+#   ${DOJ_DB_SLAVE_HOST:mysql-read}    从库 Service 名（同上）
+#
+# 注意：
+#   - 旧 shared-jdbc-read.yaml 已删除：其 spring.datasource.read.* 是
+#     Spring Boot 不认识的属性，无法生效；读写分离统一由本文件的
+#     readwrite-splitting 规则完成（slave 即读库）
+#   - 排障：把 props.sql-show 改为 true，应用日志会打印真实路由 SQL
+# ═══════════════════════════════════════════════════════════════
+
+spring:
+  shardingsphere:
+    mode:
+      type: Memory            # 不连治理中心，规则每次启动重建
+    props:
+      sql-show: false         # true 时打印真实路由 SQL（排障用）
+    datasource:
+      names: master, slave
+      master:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://${DOJ_DB_MASTER_HOST:mysql-write}:3306/${doj.db.name}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true
+        username: ${DOJ_DB_USER:root}
+        password: ${doj.db.password:123}
+        maximum-pool-size: 10
+        minimum-idle: 5
+        connection-timeout: 20000
+        connection-test-query: select 1
+        auto-commit: true
+      slave:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://${DOJ_DB_SLAVE_HOST:mysql-read}:3306/${doj.db.name}?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true
+        username: ${DOJ_DB_USER:root}
+        password: ${doj.db.password:123}
+        maximum-pool-size: 10
+        minimum-idle: 5
+        connection-timeout: 20000
+        connection-test-query: select 1
+        auto-commit: true
+    rules:
+      readwrite-splitting:
+        data-sources:
+          doj-rw:
+            type: Static
+            props:
+              write-data-source-name: master
+              read-data-source-names: slave
+            load-balancer-name: round_robin
+        load-balancers:
+          round_robin:
+            type: ROUND_ROBIN
+
+# ─── MyBatis-Plus 全局配置 ─────────────────────────────────────
+mybatis-plus:
+  global-config:
+    db-config:
+      update-strategy: not_null            # 只更新非 null 字段（避免误清空）
+      id-type: auto                        # 主键自增

@@ -1,0 +1,40 @@
+# ═══════════════════════════════════════════════════════════════
+# Problem Service — 本地开发配置
+# ═══════════════════════════════════════════════════════════════
+# K8s 部署时：DB 和 ES 配置从 Nacos 拉取
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: ${doj.port.problem-service}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+# ─── 数据库库名（K8s 与本地共用）───────────────────────────
+# Nacos shared-jdbc.yaml 的 ${doj.db.name} 引用此值
+doj:
+  db:
+    name: doj_problem
+
+# ─── 本地开发时取消注释下面配置 ──────────────────────────
+# ⚠️ K8s 环境由 Nacos shared-jdbc.yaml 和 shared-redis.yaml 提供配置
+# doj:
+#     db:
+#         host: ${DOJ_DB_HOST:mysql-write}
+#         name: doj_problem
+#         user: ${DOJ_DB_USER:root}
+#         pwd: ${DOJ_DB_PWD:123}
+#     swagger:
+#         title: 题目接口文档
+#         scan: com.decade.doj.problem.controller
+#
+# spring:
+#   elasticsearch:
+#     uris: ${DOJ_ELASTICSEARCH_URIS:http://elasticsearch:9200}
